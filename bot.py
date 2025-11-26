@@ -10,7 +10,6 @@ from telegram.ext import (
     CallbackContext,
     PreCheckoutQueryHandler,
     MessageHandler,
-    JobQueue,
     filters,
 )
 
@@ -20,6 +19,9 @@ DB_URL = os.getenv("DATABASE_URL")
 
 _channel_ids_str = os.getenv("CHANNEL_IDS", "")
 CHANNEL_IDS = [int(x.strip()) for x in _channel_ids_str.split(",") if x.strip()]
+
+_admin_ids_str = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x.strip()) for x in _admin_ids_str.split(",") if x.strip()]
 
 TITLE = "Accesso canale premium"
 DESC = "Accesso ai contenuti esclusivi per 30 giorni."
@@ -33,11 +35,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ========= DB (PostgreSQL) =========
+# ========= UTILS =========
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# ========= DB (PostgreSQL via psycopg 3) =========
 def get_conn():
     if not DB_URL:
         raise RuntimeError("DATABASE_URL non impostata!")
-    # psycopg 3
     return psycopg.connect(DB_URL)
 
 
@@ -91,7 +97,6 @@ def get_expires_at(user_id: int) -> datetime | None:
 
     if not row or not row[0]:
         return None
-    # row[0] è già un datetime con tz gestito da psycopg2
     return row[0].astimezone(timezone.utc)
 
 
@@ -115,6 +120,7 @@ async def kick_user_from_all_chats(context: CallbackContext):
     now = datetime.now(timezone.utc)
     expires_at = get_expires_at(user_id)
 
+    # Se nel frattempo ha rinnovato ed è ancora valido, NON kicchiamo
     if expires_at and expires_at > now:
         logger.info(
             "Skip kick per user %s: abbonamento rinnovato (expires_at=%s)",
@@ -128,16 +134,20 @@ async def kick_user_from_all_chats(context: CallbackContext):
             await context.bot.ban_chat_member(chat_id=ch_id, user_id=user_id)
             logger.info("Utente %s bannato da chat %s", user_id, ch_id)
         except Exception as e:
-            # Può fallire per permessi, tipo di chat, ecc.
             logger.warning("Errore ban utente %s da %s: %s", user_id, ch_id, e)
 
 
-def schedule_all_kicks(job_queue: JobQueue):
+def schedule_all_kicks(application: Application):
     """
     All'avvio del bot:
     - legge tutte le scadenze dal DB
     - programma i job di kick (anche quelli già scaduti da eseguire subito)
     """
+    jq = application.job_queue
+    if jq is None:
+        logger.warning("JobQueue non disponibile: nessun kick schedulato all'avvio.")
+        return
+
     now = datetime.now(timezone.utc)
     members = get_all_members()
     logger.info("Trovati %s membri in DB per scheduling kick.", len(members))
@@ -152,7 +162,7 @@ def schedule_all_kicks(job_queue: JobQueue):
         else:
             when = expires_at
 
-        job_queue.run_once(
+        jq.run_once(
             kick_user_from_all_chats,
             when=when,
             data={"user_id": user_id},
@@ -178,7 +188,7 @@ async def buy(update: Update, context: CallbackContext):
         title=TITLE,
         description=DESC,
         payload=f"premium_{update.effective_chat.id}",
-        provider_token="",
+        provider_token="",  # per Telegram Stars deve essere stringa vuota
         currency="XTR",
         prices=prices,
     )
@@ -197,18 +207,27 @@ async def successful_payment_handler(update: Update, context: CallbackContext):
     now = datetime.now(timezone.utc)
     old_expires = get_expires_at(user.id)
 
+    # Se aveva ancora abbonamento attivo, estendo da lì; altrimenti parto da adesso
     base = old_expires if (old_expires and old_expires > now) else now
     new_expires = base + timedelta(days=SUB_DAYS)
 
     set_subscription(user.id, user.username, new_expires)
 
-    context.job_queue.run_once(
-        kick_user_from_all_chats,
-        when=new_expires,
-        data={"user_id": user.id},
-        name=f"kick_{user.id}",
-    )
+    # Proviamo a schedulare il kick (se c'è la JobQueue)
+    jq = context.application.job_queue
+    if jq is not None:
+        jq.run_once(
+            kick_user_from_all_chats,
+            when=new_expires,
+            data={"user_id": user.id},
+            name=f"kick_{user.id}",
+        )
+    else:
+        logger.warning(
+            "JobQueue non disponibile: nessun kick schedulato per user %s.", user.id
+        )
 
+    # Crea link di invito con scadenza breve, ma l'accesso reale è controllato dai kick
     invite_expire = now + timedelta(hours=1)
     links = []
 
@@ -219,7 +238,6 @@ async def successful_payment_handler(update: Update, context: CallbackContext):
                 await context.bot.unban_chat_member(chat_id=ch_id, user_id=user.id)
                 logger.info("Unban utente %s da chat %s", user.id, ch_id)
             except Exception as e:
-                # Se fallisce perché non era bannato o è un canale con limitazioni, ok
                 logger.debug(
                     "Unban non necessario/possibile per utente %s in %s: %s",
                     user.id,
@@ -245,6 +263,73 @@ async def successful_payment_handler(update: Update, context: CallbackContext):
     )
 
 
+# ========= COMANDI ADMIN / UTENTE =========
+async def subinfo(update: Update, context: CallbackContext):
+    """ /subinfo - mostra la propria scadenza. """
+    user = update.effective_user
+    now = datetime.now(timezone.utc)
+    expires = get_expires_at(user.id)
+
+    if not expires:
+        await update.message.reply_text("Non risulti avere un abbonamento registrato.")
+        return
+
+    if expires <= now:
+        await update.message.reply_text(
+            f"Il tuo abbonamento è SCADUTO il {expires.strftime('%d/%m/%Y %H:%M UTC')}."
+        )
+    else:
+        await update.message.reply_text(
+            f"Il tuo abbonamento è ATTIVO fino al {expires.strftime('%d/%m/%Y %H:%M UTC')}."
+        )
+
+
+async def forcekick(update: Update, context: CallbackContext):
+    """
+    /forcekick <user_id>
+    - Solo admin (ADMIN_IDS)
+    - imposta scadenza "now" e programma un kick immediato
+    """
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Comando riservato agli admin.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Uso: /forcekick <user_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id non valido. Deve essere un numero.")
+        return
+
+    now = datetime.now(timezone.utc)
+
+    # Porta la sua scadenza a "now" per coerenza con la logica del bot
+    set_subscription(target_id, None, now)
+
+    jq = context.application.job_queue
+    if jq is not None:
+        jq.run_once(
+            kick_user_from_all_chats,
+            when=now + timedelta(seconds=2),
+            data={"user_id": target_id},
+            name=f"forcekick_{target_id}_{int(now.timestamp())}",
+        )
+        await update.message.reply_text(
+            f"✅ Kick forzato schedulato per user_id {target_id}."
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ JobQueue non disponibile: non posso schedulare il kick automatico."
+        )
+        logger.warning(
+            "JobQueue non disponibile durante forcekick per user %s.", target_id
+        )
+
+
 # ========= MAIN =========
 def main():
     if not BOT_TOKEN:
@@ -257,20 +342,22 @@ def main():
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
-    schedule_all_kicks(app.job_queue)
+
+    # Schedula i kick in base a ciò che è nel DB
+    schedule_all_kicks(app)
 
     # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("buy", buy))
+    app.add_handler(CommandHandler("subinfo", subinfo))
+    app.add_handler(CommandHandler("forcekick", forcekick))
+
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
     logger.info("Bot avviato e in ascolto...")
     app.run_polling()
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
