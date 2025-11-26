@@ -2,7 +2,7 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 
-import psycopg2
+import psycopg
 from telegram import Update, LabeledPrice
 from telegram.ext import (
     Application,
@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 def get_conn():
     if not DB_URL:
         raise RuntimeError("DATABASE_URL non impostata!")
-    return psycopg2.connect(DB_URL)
+    # psycopg 3
+    return psycopg.connect(DB_URL)
 
 
 def init_db():
