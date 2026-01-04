@@ -598,7 +598,7 @@ def main():
     if not CHANNEL_IDS:
         raise RuntimeError("CHANNEL_IDS non impostato o vuoto!")
     if not ADMIN_IDS:
-        raise RuntimeError("ADMIN_IDS non impostato o vuoto!")
+        raise RuntimeError(f"ADMIN_IDS non impostato o vuoto! Valore env={os.getenv('ADMIN_IDS')!r}")
 
     init_db()
 
