@@ -367,8 +367,8 @@ async def buy_choice_callback(update: Update, context: CallbackContext):
     if q.data == "pay_manual":
         await q.message.reply_text(
             "Ok ✅\n\n"
-            "Inserisci il *codice* che ti ha dato l'admin con:\n"
-            "`/redeem IL_TUO_CODICE`\n\n"
+            "Effettua il pagamento di 4€ in TON sul seguente wallet (UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta la della transaction del pagamento :\n"
+            "`/redeem transaction`\n\n"
             "Esempio: `/redeem ABCD-1234`",
             parse_mode="Markdown",
         )
