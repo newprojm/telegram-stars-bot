@@ -331,6 +331,7 @@ async def start(update: Update, context: CallbackContext):
     await update.message.reply_text(
         f"Benvenuto 👋\n\n"
         f"Accesso 30 giorni → {PRICE_STARS} ⭐\n"
+        f"Accesso 30 giorni → 4€ pagamento TONCOIN\n"
         f"Usa /buy per scegliere il metodo."
     )
 
@@ -367,7 +368,7 @@ async def buy_choice_callback(update: Update, context: CallbackContext):
     if q.data == "pay_manual":
         await q.message.reply_text(
             "Ok ✅\n\n"
-            "Effettua il pagamento di 4€ in TON sul seguente wallet (UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta la della transaction del pagamento :\n"
+            "Effettua il pagamento di 4€ in TON sul seguente wallet (UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta l'id della transaction del pagamento :\n"
             "`/redeem transaction`\n\n"
             "Esempio: `/redeem ABCD-1234`",
             parse_mode="Markdown",
