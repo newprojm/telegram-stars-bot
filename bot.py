@@ -170,6 +170,17 @@ def upsert_pending_manual_request(user_id: int, username: str | None, code: str)
     conn.close()
     return req_id
 
+async def pingadmin(update: Update, context: CallbackContext):
+    user = update.effective_user
+    await update.message.reply_text(f"Ping inviato agli admin: {ADMIN_IDS}")
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=f"✅ Ping da {user.id}")
+            logger.info("Ping inviato ad admin_id=%s", admin_id)
+        except Exception as e:
+            logger.exception("ERRORE ping admin_id=%s: %s", admin_id, e)
+
 
 def get_pending_manual_request(user_id: int) -> tuple[int, str, str, str | None] | None:
     """
@@ -607,6 +618,8 @@ def main():
 
     # Schedula i kick in base a ciò che è nel DB
     schedule_all_kicks(app)
+
+    app.add_handler(CommandHandler("pingadmin", pingadmin))
 
     # Handlers base
     app.add_handler(CommandHandler("start", start))
