@@ -24,21 +24,35 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 
 _channel_ids_str = os.getenv("CHANNEL_IDS", "")
-CHANNEL_IDS = [int(x.strip()) for x in _channel_ids_str.split(",") if x.strip()]
-
 _admin_ids_str = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x.strip()) for x in _admin_ids_str.split(",") if x.strip()]
 
 TITLE = "Accesso canale premium"
 DESC = "Accesso ai contenuti esclusivi per 30 giorni."
-PRICE_STARS = 300
-SUB_DAYS = 30
+PRICE_STARS = 300  # prezzo in Telegram Stars
+SUB_DAYS = 30      # durata abbonamento in giorni
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def parse_id_list(raw: str) -> list[int]:
+    ids: list[int] = []
+    for part in (raw or "").split(","):
+        p = part.strip().strip('"').strip("'")
+        if not p:
+            continue
+        if not p.lstrip("-").isdigit():
+            logger.warning("ID non numerico ignorato: %r", p)
+            continue
+        ids.append(int(p))
+    return ids
+
+
+CHANNEL_IDS = parse_id_list(_channel_ids_str)
+ADMIN_IDS = parse_id_list(_admin_ids_str)
 
 
 # ========= UTILS =========
@@ -54,77 +68,89 @@ def get_conn():
 
 
 def init_db():
-    """Crea le tabelle se non esistono."""
+    """
+    Inizializza DB:
+    - members
+    - manual_requests
+    - unique index parziale: 1 sola richiesta PENDING per user_id
+    """
     conn = get_conn()
-    cur = conn.cursor()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS members (
+                    user_id    BIGINT PRIMARY KEY,
+                    username   TEXT,
+                    expires_at TIMESTAMPTZ
+                )
+                """
+            )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS members (
-            user_id    BIGINT PRIMARY KEY,
-            username   TEXT,
-            expires_at TIMESTAMPTZ
-        )
-        """
-    )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS manual_requests (
+                    id           BIGSERIAL PRIMARY KEY,
+                    user_id      BIGINT NOT NULL,
+                    username     TEXT,
+                    code         TEXT NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/APPROVED/REJECTED
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    decided_at   TIMESTAMPTZ
+                )
+                """
+            )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS manual_requests (
-            id           BIGSERIAL PRIMARY KEY,
-            user_id      BIGINT NOT NULL,
-            username     TEXT,
-            code         TEXT NOT NULL,
-            status       TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/APPROVED/REJECTED
-            requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            decided_at   TIMESTAMPTZ
-        )
-        """
-    )
+            # 1 sola richiesta PENDING per utente (PostgreSQL: unique index parziale)
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_manual_requests_pending_user
+                ON manual_requests (user_id)
+                WHERE status = 'PENDING'
+                """
+            )
 
-    # Un solo PENDING per utente (parziale, PostgreSQL)
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_manual_requests_pending_user
-        ON manual_requests (user_id)
-        WHERE status = 'PENDING'
-        """
-    )
+            # Indici utili
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_manual_requests_user_status_time
+                ON manual_requests (user_id, status, requested_at DESC)
+                """
+            )
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("Tabelle pronte: members, manual_requests.")
+        conn.commit()
+        logger.info("DB pronto: tabelle + indici verificati/creati.")
+    finally:
+        conn.close()
 
 
 def set_subscription(user_id: int, username: str | None, expires_at: datetime):
-    """Imposta/aggiorna la scadenza dell'abbonamento per un utente."""
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO members (user_id, username, expires_at)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET
-            username   = EXCLUDED.username,
-            expires_at = EXCLUDED.expires_at
-        """,
-        (user_id, username, expires_at.astimezone(timezone.utc)),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("Set subscription per user_id=%s fino a %s", user_id, expires_at)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO members (user_id, username, expires_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    username   = EXCLUDED.username,
+                    expires_at = EXCLUDED.expires_at
+                """,
+                (user_id, username, expires_at.astimezone(timezone.utc)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_expires_at(user_id: int) -> datetime | None:
-    """Ritorna la scadenza abbonamento di un utente (UTC) oppure None."""
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT expires_at FROM members WHERE user_id = %s", (user_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT expires_at FROM members WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
 
     if not row or not row[0]:
         return None
@@ -132,110 +158,109 @@ def get_expires_at(user_id: int) -> datetime | None:
 
 
 def get_all_members():
-    """Ritorna lista di (user_id, expires_at) per tutti gli utenti."""
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, expires_at FROM members")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id, expires_at FROM members")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
     return rows
 
 
-# ========= MANUAL REQUESTS =========
+# ========= MANUAL REQUESTS (NO ON CONSTRAINT! perché è un INDEX parziale) =========
 def upsert_pending_manual_request(user_id: int, username: str | None, code: str) -> int:
     """
-    Garantisce 1 sola richiesta PENDING per utente.
-    Se esiste già PENDING, aggiorna code/username/requested_at.
-    Ritorna req_id.
+    Garantisce 1 sola richiesta PENDING per user_id.
+    Non usa ON CONSTRAINT (perché uq_manual_requests_pending_user è un INDEX, non una CONSTRAINT).
+    Strategia:
+      1) UPDATE della PENDING esistente
+      2) se non esiste -> INSERT
     """
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO manual_requests (user_id, username, code, status, requested_at)
-        VALUES (%s, %s, %s, 'PENDING', NOW())
-        ON CONFLICT ON CONSTRAINT uq_manual_requests_pending_user
-        DO UPDATE SET
-            username     = EXCLUDED.username,
-            code         = EXCLUDED.code,
-            requested_at = NOW()
-        RETURNING id
-        """,
-        (user_id, username, code),
-    )
-    req_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return req_id
+    try:
+        with conn.cursor() as cur:
+            # 1) UPDATE pending esistente
+            cur.execute(
+                """
+                UPDATE manual_requests
+                SET username=%s, code=%s, requested_at=NOW()
+                WHERE user_id=%s AND status='PENDING'
+                RETURNING id
+                """,
+                (username, code, user_id),
+            )
+            row = cur.fetchone()
+            if row:
+                conn.commit()
+                return row[0]
 
-async def pingadmin(update: Update, context: CallbackContext):
-    user = update.effective_user
-    await update.message.reply_text(f"Ping inviato agli admin: {ADMIN_IDS}")
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(chat_id=admin_id, text=f"✅ Ping da {user.id}")
-            logger.info("Ping inviato ad admin_id=%s", admin_id)
-        except Exception as e:
-            logger.exception("ERRORE ping admin_id=%s: %s", admin_id, e)
+            # 2) INSERT nuova pending
+            cur.execute(
+                """
+                INSERT INTO manual_requests (user_id, username, code, status, requested_at)
+                VALUES (%s, %s, %s, 'PENDING', NOW())
+                RETURNING id
+                """,
+                (user_id, username, code),
+            )
+            req_id = cur.fetchone()[0]
+        conn.commit()
+        return req_id
+    finally:
+        conn.close()
 
 
 def get_pending_manual_request(user_id: int) -> tuple[int, str, str, str | None] | None:
     """
-    Ritorna (id, code, status, username) dell'ultima richiesta PENDING dell'utente.
+    Ritorna (id, code, status, username) della richiesta PENDING dell'utente.
     """
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, code, status, username
-        FROM manual_requests
-        WHERE user_id=%s AND status='PENDING'
-        ORDER BY requested_at DESC
-        LIMIT 1
-        """,
-        (user_id,),
-    )
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row  # None oppure (id, code, status, username)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, code, status, username
+                FROM manual_requests
+                WHERE user_id=%s AND status='PENDING'
+                ORDER BY requested_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return row
 
 
 def decide_manual_request(req_id: int, status: str):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE manual_requests
-        SET status=%s, decided_at=NOW()
-        WHERE id=%s
-        """,
-        (status, req_id),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE manual_requests
+                SET status=%s, decided_at=NOW()
+                WHERE id=%s
+                """,
+                (status, req_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
-# ========= JOB: KICK DAI GRUPPI / CANALI =========
+# ========= JOB: KICK =========
 async def kick_user_from_all_chats(context: CallbackContext):
-    """Job che banna l'utente da tutti i gruppi/canali quando scade l'abbonamento."""
     job = context.job
     user_id = job.data["user_id"]
 
     now = datetime.now(timezone.utc)
     expires_at = get_expires_at(user_id)
 
-    # Se nel frattempo ha rinnovato ed è ancora valido, NON kicchiamo
     if expires_at and expires_at > now:
-        logger.info(
-            "Skip kick per user %s: abbonamento rinnovato (expires_at=%s)",
-            user_id,
-            expires_at,
-        )
+        logger.info("Skip kick per user %s: rinnovato (expires_at=%s)", user_id, expires_at)
         return
 
     for ch_id in CHANNEL_IDS:
@@ -247,11 +272,6 @@ async def kick_user_from_all_chats(context: CallbackContext):
 
 
 def schedule_all_kicks(application: Application):
-    """
-    All'avvio del bot:
-    - legge tutte le scadenze dal DB
-    - programma i job di kick (anche quelli già scaduti da eseguire subito)
-    """
     jq = application.job_queue
     if jq is None:
         logger.warning("JobQueue non disponibile: nessun kick schedulato all'avvio.")
@@ -265,7 +285,6 @@ def schedule_all_kicks(application: Application):
         if not expires_at:
             continue
         expires_at = expires_at.astimezone(timezone.utc)
-
         when = (now + timedelta(seconds=5)) if expires_at <= now else expires_at
 
         jq.run_once(
@@ -274,15 +293,10 @@ def schedule_all_kicks(application: Application):
             data={"user_id": user_id},
             name=f"kick_{user_id}",
         )
-        logger.info("Kick schedulato per user %s alle %s", user_id, when)
 
 
-# ========= CORE: GRANT ACCESS (riusata da Stars e Manuale) =========
+# ========= CORE: GRANT ACCESS =========
 async def grant_access(user_id: int, username: str | None, context: CallbackContext) -> datetime:
-    """
-    Estende/attiva l'accesso, schedula kick, crea link di invito e li invia all'utente.
-    Ritorna new_expires.
-    """
     now = datetime.now(timezone.utc)
     old_expires = get_expires_at(user_id)
 
@@ -299,16 +313,12 @@ async def grant_access(user_id: int, username: str | None, context: CallbackCont
             data={"user_id": user_id},
             name=f"kick_{user_id}",
         )
-    else:
-        logger.warning("JobQueue non disponibile: nessun kick schedulato per user %s.", user_id)
 
-    # Link invito (scadenza breve)
     invite_expire = now + timedelta(hours=1)
     links = []
 
     for ch_id in CHANNEL_IDS:
         try:
-            # Unban preventivo
             try:
                 await context.bot.unban_chat_member(chat_id=ch_id, user_id=user_id)
             except Exception:
@@ -333,30 +343,24 @@ async def grant_access(user_id: int, username: str | None, context: CallbackCont
             f"{text_links}"
         ),
     )
-
     return new_expires
 
 
-# ========= HANDLER BOT =========
+# ========= HANDLERS =========
 async def start(update: Update, context: CallbackContext):
     await update.message.reply_text(
         f"Benvenuto 👋\n\n"
         f"Accesso 30 giorni → {PRICE_STARS} ⭐\n"
-        f"Accesso 30 giorni → 4€ pagamento TONCOIN\n"
         f"Usa /buy per scegliere il metodo."
     )
 
 
 async def buy(update: Update, context: CallbackContext):
-    """Mostra 2 opzioni: Stars automatico e Manuale (codice + approvazione admin)."""
     keyboard = [
         [InlineKeyboardButton(f"Paga {PRICE_STARS}⭐ (Telegram Stars)", callback_data="pay_stars")],
         [InlineKeyboardButton("Pagamento manuale (inserisci codice)", callback_data="pay_manual")],
     ]
-    await update.message.reply_text(
-        "Scegli il metodo di pagamento:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await update.message.reply_text("Scegli il metodo di pagamento:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def buy_choice_callback(update: Update, context: CallbackContext):
@@ -370,7 +374,7 @@ async def buy_choice_callback(update: Update, context: CallbackContext):
             title=TITLE,
             description=DESC,
             payload=f"premium_{q.message.chat_id}",
-            provider_token="",  # Stars
+            provider_token="",
             currency="XTR",
             prices=prices,
         )
@@ -379,39 +383,14 @@ async def buy_choice_callback(update: Update, context: CallbackContext):
     if q.data == "pay_manual":
         await q.message.reply_text(
             "Ok ✅\n\n"
-            "Effettua il pagamento di 4€ in TON sul seguente wallet (UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta l'id della transaction del pagamento :\n"
-            "`/redeem transaction`\n\n"
+            "Effettua il pagamento di 4€ in TON sul seguente wallet (UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta l'id della transaction del pagamento:\n"
+            "`/redeem transaction id`\n\n"
             "Esempio: `/redeem ABCD-1234`",
             parse_mode="Markdown",
         )
 
 
-async def precheckout_handler(update: Update, context: CallbackContext):
-    """Accetta qualsiasi pre-checkout (aggiungi controlli se vuoi)."""
-    await update.pre_checkout_query.answer(ok=True)
-
-
-async def successful_payment_handler(update: Update, context: CallbackContext):
-    """Gestisce il pagamento Stars andato a buon fine."""
-    msg = update.message
-    user = msg.from_user
-
-    new_expires = await grant_access(user.id, user.username, context)
-
-    await msg.reply_text(
-        "Pagamento ricevuto! 🎉\n"
-        f"Accesso attivo fino al: {new_expires.strftime('%d/%m/%Y %H:%M UTC')}\n"
-        "(Ti ho inviato i link in chat.)"
-    )
-
-
-# ========= MANUALE: UTENTE /REDEEM =========
 async def redeem(update: Update, context: CallbackContext):
-    """
-    /redeem CODICE
-    - salva/aggiorna richiesta PENDING (una sola per utente)
-    - notifica agli admin con pulsanti Approva/Rifiuta
-    """
     if not context.args:
         await update.message.reply_text("Uso: /redeem CODICE")
         return
@@ -424,7 +403,7 @@ async def redeem(update: Update, context: CallbackContext):
     await update.message.reply_text(
         "Richiesta inviata ✅\n"
         "Appena l’admin approva, riceverai i link di accesso.\n\n"
-        "Nota: se reinvii /redeem, aggiorni la richiesta in sospeso."
+        "Se reinvii /redeem, aggiorni la richiesta in sospeso."
     )
 
     keyboard = InlineKeyboardMarkup([[
@@ -435,26 +414,21 @@ async def redeem(update: Update, context: CallbackContext):
     text = (
         "🧾 Richiesta pagamento manuale (PENDING)\n"
         f"• user: {user.full_name}\n"
-        f"• username: @{user.username}\n" if user.username else f"• username: (none)\n"
-        f"• user_id: {user.id}\n"
-        f"• code: {code}\n"
-        f"• req_id: {req_id}\n"
+        + (f"• username: @{user.username}\n" if user.username else "• username: (none)\n")
+        + f"• user_id: {user.id}\n"
+        + f"• code: {code}\n"
+        + f"• req_id: {req_id}\n"
     )
 
     for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_message(chat_id=admin_id, text=text, reply_markup=keyboard)
+            logger.info("Notifica manuale inviata ad admin_id=%s", admin_id)
         except Exception as e:
-            logger.warning("Errore notifica admin %s: %s", admin_id, e)
+            logger.exception("ERRORE notifica admin_id=%s: %s", admin_id, e)
 
 
-# ========= MANUALE: CALLBACK ADMIN APPROVA/RIFIUTA =========
 async def manual_admin_callback(update: Update, context: CallbackContext):
-    """
-    Callback data:
-    - man_approve:<user_id>:<req_id>
-    - man_reject:<user_id>:<req_id>
-    """
     q = update.callback_query
     admin = q.from_user
     await q.answer()
@@ -477,7 +451,6 @@ async def manual_admin_callback(update: Update, context: CallbackContext):
             pass
         return
 
-    # Verifica che la richiesta sia ancora PENDING
     pending = get_pending_manual_request(user_id)
     if not pending:
         try:
@@ -497,36 +470,18 @@ async def manual_admin_callback(update: Update, context: CallbackContext):
     if action == "man_reject":
         decide_manual_request(req_id, "REJECTED")
         try:
-            await q.edit_message_text(
-                f"❌ RIFIUTATO\nuser_id={user_id}\nreq_id={req_id}\ncode={pending_code}"
-            )
+            await q.edit_message_text(f"❌ RIFIUTATO\nuser_id={user_id}\nreq_id={req_id}\ncode={pending_code}")
         except Exception:
             pass
-
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="❌ Codice rifiutato. Contatta l’admin se pensi sia un errore."
-            )
+            await context.bot.send_message(chat_id=user_id, text="❌ Codice rifiutato. Contatta l’admin.")
         except Exception:
             pass
         return
 
     if action == "man_approve":
         decide_manual_request(req_id, "APPROVED")
-
-        try:
-            new_expires = await grant_access(user_id, pending_username, context)
-        except Exception as e:
-            logger.exception("Errore grant_access per user %s: %s", user_id, e)
-            try:
-                await q.edit_message_text(
-                    f"⚠️ APPROVATO ma errore nell'attivazione.\nuser_id={user_id}\nreq_id={req_id}\nDettagli log."
-                )
-            except Exception:
-                pass
-            return
-
+        new_expires = await grant_access(user_id, pending_username, context)
         try:
             await q.edit_message_text(
                 "✅ APPROVATO\n"
@@ -540,9 +495,23 @@ async def manual_admin_callback(update: Update, context: CallbackContext):
         return
 
 
-# ========= COMANDI ADMIN / UTENTE =========
+async def precheckout_handler(update: Update, context: CallbackContext):
+    await update.pre_checkout_query.answer(ok=True)
+
+
+async def successful_payment_handler(update: Update, context: CallbackContext):
+    msg = update.message
+    user = msg.from_user
+    new_expires = await grant_access(user.id, user.username, context)
+
+    await msg.reply_text(
+        "Pagamento ricevuto! 🎉\n"
+        f"Accesso attivo fino al: {new_expires.strftime('%d/%m/%Y %H:%M UTC')}\n"
+        "(Ti ho inviato i link in chat.)"
+    )
+
+
 async def subinfo(update: Update, context: CallbackContext):
-    """ /subinfo - mostra la propria scadenza. """
     user = update.effective_user
     now = datetime.now(timezone.utc)
     expires = get_expires_at(user.id)
@@ -562,11 +531,6 @@ async def subinfo(update: Update, context: CallbackContext):
 
 
 async def forcekick(update: Update, context: CallbackContext):
-    """
-    /forcekick <user_id>
-    - Solo admin (ADMIN_IDS)
-    - imposta scadenza "now" e programma un kick immediato
-    """
     user = update.effective_user
     if not is_admin(user.id):
         await update.message.reply_text("❌ Comando riservato agli admin.")
@@ -583,8 +547,6 @@ async def forcekick(update: Update, context: CallbackContext):
         return
 
     now = datetime.now(timezone.utc)
-
-    # Porta la scadenza a "now"
     set_subscription(target_id, None, now)
 
     jq = context.application.job_queue
@@ -598,43 +560,37 @@ async def forcekick(update: Update, context: CallbackContext):
         await update.message.reply_text(f"✅ Kick forzato schedulato per user_id {target_id}.")
     else:
         await update.message.reply_text("⚠️ JobQueue non disponibile: non posso schedulare il kick automatico.")
-        logger.warning("JobQueue non disponibile durante forcekick per user %s.", target_id)
 
 
-# ========= MAIN =========
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN non impostato!")
     if not DB_URL:
         raise RuntimeError("DATABASE_URL non impostata!")
     if not CHANNEL_IDS:
-        raise RuntimeError("CHANNEL_IDS non impostato o vuoto!")
+        raise RuntimeError(f"CHANNEL_IDS non impostato o vuoto! Valore env={os.getenv('CHANNEL_IDS')!r}")
     if not ADMIN_IDS:
         raise RuntimeError(f"ADMIN_IDS non impostato o vuoto! Valore env={os.getenv('ADMIN_IDS')!r}")
+
+    logger.info("ADMIN_IDS parsed: %s", ADMIN_IDS)
+    logger.info("CHANNEL_IDS parsed: %s", CHANNEL_IDS)
 
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Schedula i kick in base a ciò che è nel DB
     schedule_all_kicks(app)
 
-    app.add_handler(CommandHandler("pingadmin", pingadmin))
-
-    # Handlers base
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CallbackQueryHandler(buy_choice_callback, pattern=r"^pay_(stars|manual)$"))
 
-    # Manuale
     app.add_handler(CommandHandler("redeem", redeem))
     app.add_handler(CallbackQueryHandler(manual_admin_callback, pattern=r"^man_(approve|reject):"))
 
-    # Info/admin
     app.add_handler(CommandHandler("subinfo", subinfo))
     app.add_handler(CommandHandler("forcekick", forcekick))
 
-    # Stars payment
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
