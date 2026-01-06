@@ -28,7 +28,7 @@ _admin_ids_str = os.getenv("ADMIN_IDS", "")
 
 TITLE = "Accesso canale premium"
 DESC = "Accesso ai contenuti esclusivi per 30 giorni."
-PRICE_STARS = 300  # prezzo in Telegram Stars
+PRICE_STARS = 250  # prezzo in Telegram Stars
 SUB_DAYS = 30      # durata abbonamento in giorni
 
 logging.basicConfig(
@@ -383,7 +383,7 @@ async def buy_choice_callback(update: Update, context: CallbackContext):
     if q.data == "pay_manual":
         await q.message.reply_text(
             "Ok ✅\n\n"
-            "Effettua il pagamento di 4€ in TON sul seguente wallet (UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta l'id della transaction del pagamento:\n"
+            "Effettua il pagamento di 3€ in TON sul seguente wallet (UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta l'id della transaction del pagamento:\n"
             "`/redeem transaction id`\n\n"
             "Esempio: `/redeem ABCD-1234`",
             parse_mode="Markdown",
@@ -454,7 +454,7 @@ async def manual_admin_callback(update: Update, context: CallbackContext):
     pending = get_pending_manual_request(user_id)
     if not pending:
         try:
-            await q.edit_message_text("⚠️ Nessuna richiesta PENDING trovata (forse già gestita).")
+            await q.edit_message_text("⚠️ Nessuna richiesta PENDING trovata.")
         except Exception:
             pass
         return
