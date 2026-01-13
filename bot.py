@@ -314,7 +314,7 @@ async def grant_access(user_id: int, username: str | None, context: CallbackCont
             name=f"kick_{user_id}",
         )
 
-    invite_expire = now + timedelta(hours=1)
+    invite_expire = now + timedelta(days=2)
     links = []
 
     for ch_id in CHANNEL_IDS:
