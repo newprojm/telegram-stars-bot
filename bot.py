@@ -72,11 +72,13 @@ def init_db():
     Inizializza DB:
     - members
     - manual_requests
+    - video_stats
     - unique index parziale: 1 sola richiesta PENDING per user_id
     """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            # Membri premium
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS members (
@@ -87,6 +89,7 @@ def init_db():
                 """
             )
 
+            # Richieste manuali
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS manual_requests (
@@ -101,7 +104,7 @@ def init_db():
                 """
             )
 
-            # 1 sola richiesta PENDING per utente (PostgreSQL: unique index parziale)
+            # 1 sola richiesta PENDING per utente
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_manual_requests_pending_user
@@ -110,11 +113,21 @@ def init_db():
                 """
             )
 
-            # Indici utili
             cur.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_manual_requests_user_status_time
                 ON manual_requests (user_id, status, requested_at DESC)
+                """
+            )
+
+            # Statistiche video
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS video_stats (
+                    channel_name TEXT PRIMARY KEY,
+                    video_count  INTEGER NOT NULL DEFAULT 0,
+                    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
                 """
             )
 
@@ -168,11 +181,27 @@ def get_all_members():
     return rows
 
 
-# ========= MANUAL REQUESTS (NO ON CONSTRAINT! perché è un INDEX parziale) =========
+def get_video_stats():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT channel_name, video_count, updated_at
+                FROM video_stats
+                ORDER BY video_count DESC, channel_name ASC
+                """
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return rows
+
+
+# ========= MANUAL REQUESTS =========
 def upsert_pending_manual_request(user_id: int, username: str | None, code: str) -> int:
     """
     Garantisce 1 sola richiesta PENDING per user_id.
-    Non usa ON CONSTRAINT (perché uq_manual_requests_pending_user è un INDEX, non una CONSTRAINT).
     Strategia:
       1) UPDATE della PENDING esistente
       2) se non esiste -> INSERT
@@ -180,7 +209,6 @@ def upsert_pending_manual_request(user_id: int, username: str | None, code: str)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # 1) UPDATE pending esistente
             cur.execute(
                 """
                 UPDATE manual_requests
@@ -195,7 +223,6 @@ def upsert_pending_manual_request(user_id: int, username: str | None, code: str)
                 conn.commit()
                 return row[0]
 
-            # 2) INSERT nuova pending
             cur.execute(
                 """
                 INSERT INTO manual_requests (user_id, username, code, status, requested_at)
@@ -284,6 +311,7 @@ def schedule_all_kicks(application: Application):
     for user_id, expires_at in members:
         if not expires_at:
             continue
+
         expires_at = expires_at.astimezone(timezone.utc)
         when = (now + timedelta(seconds=5)) if expires_at <= now else expires_at
 
@@ -346,6 +374,25 @@ async def grant_access(user_id: int, username: str | None, context: CallbackCont
     return new_expires
 
 
+# ========= HELPERS ADMIN =========
+def build_video_stats_text() -> str:
+    rows = get_video_stats()
+
+    if not rows:
+        return "📊 Nessuna statistica video presente nel database."
+
+    lines = ["📊 Statistiche video:\n"]
+    total = 0
+
+    for channel_name, video_count, updated_at in rows:
+        total += video_count
+        updated_str = updated_at.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+        lines.append(f"• {channel_name}: {video_count} video (agg. {updated_str})")
+
+    lines.append(f"\nTotale video: {total}")
+    return "\n".join(lines)
+
+
 # ========= HANDLERS =========
 async def start(update: Update, context: CallbackContext):
     await update.message.reply_text(
@@ -360,7 +407,10 @@ async def buy(update: Update, context: CallbackContext):
         [InlineKeyboardButton(f"Paga {PRICE_STARS}⭐ (Telegram Stars)", callback_data="pay_stars")],
         [InlineKeyboardButton("Pagamento manuale (inserisci codice)", callback_data="pay_manual")],
     ]
-    await update.message.reply_text("Scegli il metodo di pagamento:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        "Scegli il metodo di pagamento:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 async def buy_choice_callback(update: Update, context: CallbackContext):
@@ -383,8 +433,10 @@ async def buy_choice_callback(update: Update, context: CallbackContext):
     if q.data == "pay_manual":
         await q.message.reply_text(
             "Ok ✅\n\n"
-            "Effettua il pagamento di 4€ in TON sul seguente wallet (UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta l'id della transaction del pagamento:\n"
-            "`/redeem transaction id`\n\n"
+            "Effettua il pagamento di 4€ in TON sul seguente wallet "
+            "(UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta l'id della "
+            "transaction del pagamento:\n"
+            "`/redeem transaction_id`\n\n"
             "Esempio: `/redeem ABCD-1234`",
             parse_mode="Markdown",
         )
@@ -470,11 +522,16 @@ async def manual_admin_callback(update: Update, context: CallbackContext):
     if action == "man_reject":
         decide_manual_request(req_id, "REJECTED")
         try:
-            await q.edit_message_text(f"❌ RIFIUTATO\nuser_id={user_id}\nreq_id={req_id}\ncode={pending_code}")
+            await q.edit_message_text(
+                f"❌ RIFIUTATO\nuser_id={user_id}\nreq_id={req_id}\ncode={pending_code}"
+            )
         except Exception:
             pass
         try:
-            await context.bot.send_message(chat_id=user_id, text="❌ Codice rifiutato. Contatta l’admin.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ Codice rifiutato. Contatta l’admin."
+            )
         except Exception:
             pass
         return
@@ -559,7 +616,54 @@ async def forcekick(update: Update, context: CallbackContext):
         )
         await update.message.reply_text(f"✅ Kick forzato schedulato per user_id {target_id}.")
     else:
-        await update.message.reply_text("⚠️ JobQueue non disponibile: non posso schedulare il kick automatico.")
+        await update.message.reply_text(
+            "⚠️ JobQueue non disponibile: non posso schedulare il kick automatico."
+        )
+
+
+async def admin_menu(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Comando riservato agli admin.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("📊 Stat video", callback_data="admin_stat_video")],
+    ]
+
+    await update.message.reply_text(
+        "Pannello admin:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def admin_stats_callback(update: Update, context: CallbackContext):
+    q = update.callback_query
+    await q.answer()
+
+    user = q.from_user
+    if not is_admin(user.id):
+        try:
+            await q.edit_message_text("❌ Non sei autorizzato.")
+        except Exception:
+            pass
+        return
+
+    text = build_video_stats_text()
+
+    try:
+        await q.edit_message_text(text)
+    except Exception:
+        await q.message.reply_text(text)
+
+
+async def statvideo(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Comando riservato agli admin.")
+        return
+
+    await update.message.reply_text(build_video_stats_text())
 
 
 def main():
@@ -568,9 +672,13 @@ def main():
     if not DB_URL:
         raise RuntimeError("DATABASE_URL non impostata!")
     if not CHANNEL_IDS:
-        raise RuntimeError(f"CHANNEL_IDS non impostato o vuoto! Valore env={os.getenv('CHANNEL_IDS')!r}")
+        raise RuntimeError(
+            f"CHANNEL_IDS non impostato o vuoto! Valore env={os.getenv('CHANNEL_IDS')!r}"
+        )
     if not ADMIN_IDS:
-        raise RuntimeError(f"ADMIN_IDS non impostato o vuoto! Valore env={os.getenv('ADMIN_IDS')!r}")
+        raise RuntimeError(
+            f"ADMIN_IDS non impostato o vuoto! Valore env={os.getenv('ADMIN_IDS')!r}"
+        )
 
     logger.info("ADMIN_IDS parsed: %s", ADMIN_IDS)
     logger.info("CHANNEL_IDS parsed: %s", CHANNEL_IDS)
@@ -581,16 +689,23 @@ def main():
 
     schedule_all_kicks(app)
 
+    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("buy", buy))
-    app.add_handler(CallbackQueryHandler(buy_choice_callback, pattern=r"^pay_(stars|manual)$"))
-
     app.add_handler(CommandHandler("redeem", redeem))
-    app.add_handler(CallbackQueryHandler(manual_admin_callback, pattern=r"^man_(approve|reject):"))
-
     app.add_handler(CommandHandler("subinfo", subinfo))
+
+    # Admin commands
+    app.add_handler(CommandHandler("admin", admin_menu))
+    app.add_handler(CommandHandler("statvideo", statvideo))
     app.add_handler(CommandHandler("forcekick", forcekick))
 
+    # Callback buttons
+    app.add_handler(CallbackQueryHandler(buy_choice_callback, pattern=r"^pay_(stars|manual)$"))
+    app.add_handler(CallbackQueryHandler(manual_admin_callback, pattern=r"^man_(approve|reject):"))
+    app.add_handler(CallbackQueryHandler(admin_stats_callback, pattern=r"^admin_stat_video$"))
+
+    # Payments
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
