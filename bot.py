@@ -8,6 +8,7 @@ from telegram import (
     LabeledPrice,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
 )
 from telegram.ext import (
     Application,
@@ -28,8 +29,8 @@ _admin_ids_str = os.getenv("ADMIN_IDS", "")
 
 TITLE = "Accesso canale premium"
 DESC = "Accesso ai contenuti esclusivi per 30 giorni."
-PRICE_STARS = 300  # prezzo in Telegram Stars
-SUB_DAYS = 30      # durata abbonamento in giorni
+PRICE_STARS = 300
+SUB_DAYS = 30
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -60,7 +61,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ========= DB (PostgreSQL via psycopg 3) =========
+# ========= DB =========
 def get_conn():
     if not DB_URL:
         raise RuntimeError("DATABASE_URL non impostata!")
@@ -68,17 +69,9 @@ def get_conn():
 
 
 def init_db():
-    """
-    Inizializza DB:
-    - members
-    - manual_requests
-    - video_stats
-    - unique index parziale: 1 sola richiesta PENDING per user_id
-    """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Membri premium
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS members (
@@ -89,7 +82,6 @@ def init_db():
                 """
             )
 
-            # Richieste manuali
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS manual_requests (
@@ -97,14 +89,13 @@ def init_db():
                     user_id      BIGINT NOT NULL,
                     username     TEXT,
                     code         TEXT NOT NULL,
-                    status       TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/APPROVED/REJECTED
+                    status       TEXT NOT NULL DEFAULT 'PENDING',
                     requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     decided_at   TIMESTAMPTZ
                 )
                 """
             )
 
-            # 1 sola richiesta PENDING per utente
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_manual_requests_pending_user
@@ -120,7 +111,6 @@ def init_db():
                 """
             )
 
-            # Statistiche video
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS video_stats (
@@ -131,8 +121,18 @@ def init_db():
                 """
             )
 
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_meta (
+                    meta_key   TEXT PRIMARY KEY,
+                    meta_value TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+
         conn.commit()
-        logger.info("DB pronto: tabelle + indici verificati/creati.")
+        logger.info("DB pronto: tabelle e indici verificati/creati.")
     finally:
         conn.close()
 
@@ -198,14 +198,29 @@ def get_video_stats():
     return rows
 
 
+def get_meta_value(meta_key: str) -> str | None:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT meta_value
+                FROM bot_meta
+                WHERE meta_key = %s
+                """,
+                (meta_key,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return None
+    return row[0]
+
+
 # ========= MANUAL REQUESTS =========
 def upsert_pending_manual_request(user_id: int, username: str | None, code: str) -> int:
-    """
-    Garantisce 1 sola richiesta PENDING per user_id.
-    Strategia:
-      1) UPDATE della PENDING esistente
-      2) se non esiste -> INSERT
-    """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -232,6 +247,7 @@ def upsert_pending_manual_request(user_id: int, username: str | None, code: str)
                 (user_id, username, code),
             )
             req_id = cur.fetchone()[0]
+
         conn.commit()
         return req_id
     finally:
@@ -239,9 +255,6 @@ def upsert_pending_manual_request(user_id: int, username: str | None, code: str)
 
 
 def get_pending_manual_request(user_id: int) -> tuple[int, str, str, str | None] | None:
-    """
-    Ritorna (id, code, status, username) della richiesta PENDING dell'utente.
-    """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -323,7 +336,7 @@ def schedule_all_kicks(application: Application):
         )
 
 
-# ========= CORE: GRANT ACCESS =========
+# ========= CORE =========
 async def grant_access(user_id: int, username: str | None, context: CallbackContext) -> datetime:
     now = datetime.now(timezone.utc)
     old_expires = get_expires_at(user_id)
@@ -374,26 +387,33 @@ async def grant_access(user_id: int, username: str | None, context: CallbackCont
     return new_expires
 
 
-# ========= HELPERS ADMIN =========
+# ========= VIDEO STATS =========
 def build_video_stats_text() -> str:
     rows = get_video_stats()
+    final_text = get_meta_value("final_stats_text")
 
     if not rows:
-        return "📊 Nessuna statistica video presente nel database."
+        text = "📊 Nessuna statistica video presente nel database."
+        if final_text:
+            text += f"\n\n{final_text}"
+        return text
 
     lines = ["📊 Statistiche video:\n"]
     total = 0
 
     for channel_name, video_count, updated_at in rows:
         total += video_count
-        updated_str = updated_at.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-        lines.append(f"• {channel_name}: {video_count} video (agg. {updated_str})")
+        lines.append(f"• {channel_name}: {video_count} video")
 
     lines.append(f"\nTotale video: {total}")
+
+    if final_text:
+        lines.append(final_text)
+
     return "\n".join(lines)
 
 
-# ========= HANDLERS =========
+# ========= COMMANDS =========
 async def start(update: Update, context: CallbackContext):
     await update.message.reply_text(
         f"Benvenuto 👋\n\n"
@@ -528,10 +548,7 @@ async def manual_admin_callback(update: Update, context: CallbackContext):
         except Exception:
             pass
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="❌ Codice rifiutato. Contatta l’admin."
-            )
+            await context.bot.send_message(chat_id=user_id, text="❌ Codice rifiutato. Contatta l’admin.")
         except Exception:
             pass
         return
@@ -616,9 +633,7 @@ async def forcekick(update: Update, context: CallbackContext):
         )
         await update.message.reply_text(f"✅ Kick forzato schedulato per user_id {target_id}.")
     else:
-        await update.message.reply_text(
-            "⚠️ JobQueue non disponibile: non posso schedulare il kick automatico."
-        )
+        await update.message.reply_text("⚠️ JobQueue non disponibile.")
 
 
 async def admin_menu(update: Update, context: CallbackContext):
@@ -666,46 +681,50 @@ async def statvideo(update: Update, context: CallbackContext):
     await update.message.reply_text(build_video_stats_text())
 
 
+async def post_init(application: Application):
+    commands = [
+        BotCommand("start", "Avvia il bot"),
+        BotCommand("buy", "Acquista accesso"),
+        BotCommand("subinfo", "Verifica abbonamento"),
+        BotCommand("admin", "Pannello admin"),
+        BotCommand("statvideo", "Mostra statistiche video"),
+        BotCommand("forcekick", "Kick forzato admin"),
+    ]
+    await application.bot.set_my_commands(commands)
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN non impostato!")
     if not DB_URL:
         raise RuntimeError("DATABASE_URL non impostata!")
     if not CHANNEL_IDS:
-        raise RuntimeError(
-            f"CHANNEL_IDS non impostato o vuoto! Valore env={os.getenv('CHANNEL_IDS')!r}"
-        )
+        raise RuntimeError(f"CHANNEL_IDS non impostato o vuoto! Valore env={os.getenv('CHANNEL_IDS')!r}")
     if not ADMIN_IDS:
-        raise RuntimeError(
-            f"ADMIN_IDS non impostato o vuoto! Valore env={os.getenv('ADMIN_IDS')!r}"
-        )
+        raise RuntimeError(f"ADMIN_IDS non impostato o vuoto! Valore env={os.getenv('ADMIN_IDS')!r}")
 
     logger.info("ADMIN_IDS parsed: %s", ADMIN_IDS)
     logger.info("CHANNEL_IDS parsed: %s", CHANNEL_IDS)
 
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     schedule_all_kicks(app)
 
-    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("redeem", redeem))
     app.add_handler(CommandHandler("subinfo", subinfo))
 
-    # Admin commands
     app.add_handler(CommandHandler("admin", admin_menu))
     app.add_handler(CommandHandler("statvideo", statvideo))
     app.add_handler(CommandHandler("forcekick", forcekick))
 
-    # Callback buttons
     app.add_handler(CallbackQueryHandler(buy_choice_callback, pattern=r"^pay_(stars|manual)$"))
     app.add_handler(CallbackQueryHandler(manual_admin_callback, pattern=r"^man_(approve|reject):"))
     app.add_handler(CallbackQueryHandler(admin_stats_callback, pattern=r"^admin_stat_video$"))
 
-    # Payments
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
