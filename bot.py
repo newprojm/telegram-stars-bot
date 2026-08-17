@@ -29,7 +29,7 @@ _admin_ids_str = os.getenv("ADMIN_IDS", "")
 
 TITLE = "Accesso canale premium"
 DESC = "Accesso ai contenuti esclusivi per 30 giorni."
-PRICE_STARS = 300
+PRICE_STARS = 350
 SUB_DAYS = 30
 
 logging.basicConfig(
@@ -453,7 +453,7 @@ async def buy_choice_callback(update: Update, context: CallbackContext):
     if q.data == "pay_manual":
         await q.message.reply_text(
             "Ok ✅\n\n"
-            "Effettua il pagamento di 4€ in TON sul seguente wallet "
+            "Effettua il pagamento di 5€ in TON sul seguente wallet "
             "(UQC5mmsyVKLPnlAVJS8Y_-WoMRB6Ss_YF-mHVTVQzXdrwqih) e riporta l'id della "
             "transaction del pagamento:\n"
             "`/redeem transaction_id`\n\n"
